@@ -17,9 +17,12 @@ Usage:
 from __future__ import annotations
 
 import base64
+import io
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -31,6 +34,9 @@ from pdf_features.PdfPage import PdfPage
 from pdf_features.Rectangle import Rectangle
 from pdf_token_type_labels.TokenType import TokenType
 from pdf_features.image_features.page_renderer import render_page_to_image
+
+# ── Image rendering mode ──────────────────────────────────────────────
+ImageMode = Literal["embed", "url", "placeholder"]
 
 
 # ── Line: a horizontal row of tokens, or a region placeholder ────────
@@ -122,12 +128,16 @@ class MarkdownConverter:
         table_tsr_results: list[dict] | None = None,
         pdf_path: str | None = None,
         pdf_document: object | None = None,
+        image_mode: ImageMode = "placeholder",
     ):
         self.pdf_features = pdf_features
         self.predictions = predictions or []
         self.regions = regions or []
         self.table_tsr_results = table_tsr_results or []
         self.pdf_path = pdf_path
+        self.image_mode: ImageMode = image_mode
+        # Collected extracted images when image_mode="url"
+        self.extracted_images: list[dict] = []
 
         # Reuse pre-opened document (avoids re-opening the same PDF)
         self._doc: object | None = pdf_document
@@ -596,42 +606,92 @@ class MarkdownConverter:
         alt = f"{region.region_type} p{region.page_number}"
         bbox = region.bbox
         page_number = region.page_number
+        img_filename = f"image_page{page_number}_{bbox.left}_{bbox.top}.png"
 
-        # Try to embed the actual image as base64
-        if self.pdf_path:
-            try:
-                if self._doc is None:
-                    self._doc = pdfium.PdfDocument(self.pdf_path)
-                doc = self._doc
-                pi = page_number - 1
-                if 0 <= pi < len(doc):
-                    # Cache full-page renders — avoid re-rendering same page
-                    if page_number not in self._page_render_cache:
-                        dpi = 150
-                        img = render_page_to_image(doc, pi, dpi=dpi)
-                        h, w = img.shape[:2]
-                        self._page_render_cache[page_number] = (img, w, h, dpi)
+        # ── placeholder mode: no image data at all ──────────────────
+        if self.image_mode == "placeholder":
+            return (f"<!-- {region.region_type} at "
+                    f"({bbox.left},{bbox.top}) "
+                    f"{region.width}x{region.height} -->\n\n"
+                    f"[{alt}]({img_filename})")
 
-                    img, pix_w, pix_h, dpi = self._page_render_cache[page_number]
-                    scale = dpi / 72.0
-                    x1 = max(0, int(bbox.left * scale))
-                    y1 = max(0, int(bbox.top * scale))
-                    x2 = min(pix_w, int(bbox.right * scale))
-                    y2 = min(pix_h, int(bbox.bottom * scale))
+        # ── url mode: collect image binary for later zip, use filename ──
+        if self.image_mode == "url":
+            img_bytes = self._crop_region_image(page_number, bbox)
+            if img_bytes is not None:
+                self.extracted_images.append({
+                    "filename": img_filename,
+                    "page_number": page_number,
+                    "region_type": region.region_type,
+                    "width": region.width,
+                    "height": region.height,
+                    "bytes": img_bytes,
+                })
+            return f"![{alt}](images/{img_filename})"
 
-                    if x2 > x1 and y2 > y1:
-                        crop = img[y1:y2, x1:x2]
-                        _, buf = cv2.imencode(".png", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-                        b64 = base64.b64encode(buf).decode()
-                        return f"![{alt}](data:image/png;base64,{b64})"
-            except Exception:
-                pass  # fall through to placeholder
+        # ── embed mode: base64 inline (original behaviour) ───────────
+        if self.image_mode == "embed":
+            img_bytes = self._crop_region_image(page_number, bbox)
+            if img_bytes is not None:
+                b64 = base64.b64encode(img_bytes).decode()
+                return f"![{alt}](data:image/png;base64,{b64})"
 
-        return (f"<!-- {region.region_type} at "
-                f"({bbox.left},{bbox.top}) "
-                f"{region.width}x{region.height} -->\n\n"
-                f"![{alt}](image_page{region.page_number}_"
-                f"{bbox.left}_{bbox.top}.png)")
+        # Fallback (shouldn't reach here)
+        return f"[{alt}]({img_filename})"
+
+    def _crop_region_image(
+        self, page_number: int, bbox
+    ) -> bytes | None:
+        """Crop a region from the rendered page and return PNG bytes.
+
+        Returns None if the crop fails for any reason.
+        """
+        if not self.pdf_path:
+            return None
+        try:
+            if self._doc is None:
+                self._doc = pdfium.PdfDocument(self.pdf_path)
+            doc = self._doc
+            pi = page_number - 1
+            if not (0 <= pi < len(doc)):
+                return None
+
+            # Cache full-page renders
+            if page_number not in self._page_render_cache:
+                dpi = 150
+                img = render_page_to_image(doc, pi, dpi=dpi)
+                h, w = img.shape[:2]
+                self._page_render_cache[page_number] = (img, w, h, dpi)
+
+            img, pix_w, pix_h, dpi = self._page_render_cache[page_number]
+            scale = dpi / 72.0
+            x1 = max(0, int(bbox.left * scale))
+            y1 = max(0, int(bbox.top * scale))
+            x2 = min(pix_w, int(bbox.right * scale))
+            y2 = min(pix_h, int(bbox.bottom * scale))
+
+            if not (x2 > x1 and y2 > y1):
+                return None
+
+            crop = img[y1:y2, x1:x2]
+            _, buf = cv2.imencode(".png", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+            return buf.tobytes()
+        except Exception:
+            return None
+
+    def build_images_zip(self) -> bytes | None:
+        """Build an in-memory ZIP of all extracted images.
+
+        Returns ZIP file bytes, or None if no images were extracted.
+        The ZIP contains an 'images/' folder with PNG files.
+        """
+        if not self.extracted_images:
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for img in self.extracted_images:
+                zf.writestr(f"images/{img['filename']}", img["bytes"])
+        return buf.getvalue()
 
 
 
@@ -643,11 +703,17 @@ def predictions_to_markdown(
     table_tsr_results: list[dict] | None = None,
     pdf_path: str | None = None,
     pdf_document: object | None = None,
+    image_mode: ImageMode = "placeholder",
 ) -> str:
     """One-shot: convert predictions to Markdown.
 
     Pass pdf_document (a pypdfium2.PdfDocument) to reuse an already-open
     document instead of re-opening the PDF.
+
+    image_mode controls how picture/figure regions are rendered:
+      - "embed":       base64 data URI inline (large output)
+      - "url":         relative path like `images/img.png` (use with ZIP)
+      - "placeholder": `[Figure p1](image_name.png)` — no image data
     """
     converter = MarkdownConverter(
         pdf_features=pdf_features,
@@ -656,5 +722,6 @@ def predictions_to_markdown(
         table_tsr_results=table_tsr_results or [],
         pdf_path=pdf_path,
         pdf_document=pdf_document,
+        image_mode=image_mode,
     )
     return converter.convert()
