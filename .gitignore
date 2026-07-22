@@ -1,0 +1,7 @@
+*.md
+-readme.md
+*.npy
+*.model
+*.pyc
+*.dat
+*.pdf
