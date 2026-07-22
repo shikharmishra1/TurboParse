@@ -1,0 +1,9 @@
+# ── TurboParse .dockerignore ──────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+.git/
+test/
+output.md
+.DS_Store
+*.egg-info/

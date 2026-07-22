@@ -22,6 +22,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import tempfile
 import uuid
 import zipfile
@@ -61,8 +62,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── Default model path (relative to workspace root) ───────────────────
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent / "model" / "pdf_tokens_type.model"
+# ── Model path: env var takes priority, then local fallback ───────────
+DEFAULT_MODEL_PATH = Path(
+    os.environ.get("MODEL_PATH")
+    or Path(__file__).resolve().parent.parent / "model" / "pdf_tokens_type.model"
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
