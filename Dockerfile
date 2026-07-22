@@ -29,6 +29,6 @@ RUN mkdir -p /mnt/model
 ENV MODEL_PATH=/mnt/model/pdf_tokens_type.model
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["python", "-m", "uvicorn", "api:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000"]
+CMD sh -c "python -m uvicorn api:app --app-dir src --host 0.0.0.0 --port $PORT"
